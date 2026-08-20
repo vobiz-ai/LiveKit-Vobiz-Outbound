@@ -1,6 +1,8 @@
 import logging
 import os
 import json
+from pathlib import Path
+
 from dotenv import load_dotenv
 
 from livekit import agents, api
@@ -16,16 +18,18 @@ from livekit.plugins import (
 from livekit.agents import llm
 from typing import Annotated, Optional
 
-# Load environment variables
-load_dotenv(".env")
+# Load environment variables from the .env file that sits next to this script,
+# so the agent works no matter which directory you launch it from.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outbound-agent")
 
 
-# TRUNK ID - This needs to be set after you crate your trunk
-# You can find this by running 'python setup_trunk.py --list' or checking LiveKit Dashboard
+# TRUNK ID - set OUTBOUND_TRUNK_ID in .env after you create your outbound trunk.
+# Create it with `lk sip outbound create` (LiveKit CLI) or in the LiveKit dashboard;
+# the id looks like ST_xxxxxxxxxxxx.
 OUTBOUND_TRUNK_ID = os.getenv("OUTBOUND_TRUNK_ID")
 SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN") 
 

@@ -3,15 +3,18 @@ import asyncio
 import os
 import random
 import json
+from pathlib import Path
+
 from dotenv import load_dotenv
 from livekit import api
 
-# Load environment variables
-load_dotenv(".env")
+# Load environment variables from the .env file that sits next to this script,
+# so the dispatcher works no matter which directory you launch it from.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 async def main():
     parser = argparse.ArgumentParser(description="Make an outbound call via LiveKit Agent.")
-    parser.add_argument("--to", required=True, help="The phone number to call (e.g., +91...)")
+    parser.add_argument("--to", required=True, help="The phone number to call in E.164 format (e.g., +15550003333)")
     parser.add_argument(
         "--from", dest="from_number", default=None, metavar="+E164",
         help="Override the caller ID (from number). Must be authorized on the trunk. "
@@ -46,7 +49,7 @@ async def main():
     api_secret = os.getenv("LIVEKIT_API_SECRET")
 
     if not (url and api_key and api_secret):
-        print("Error: LiveKit credentials missing in .env.local")
+        print("Error: LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET missing in .env")
         return
 
     # 2. Setup API Client
@@ -56,7 +59,7 @@ async def main():
     # We use a random suffix to ensure room names are unique
     room_name = f"call-{phone_number.replace('+', '')}-{random.randint(1000, 9999)}"
 
-    print(f"Initating call to {phone_number}...")
+    print(f"Initiating call to {phone_number}...")
     print(f"Session Room: {room_name}")
 
     try:

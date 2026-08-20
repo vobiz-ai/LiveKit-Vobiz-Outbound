@@ -1,10 +1,13 @@
 import asyncio
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 from livekit import api
 
-# Load environment variables
-load_dotenv(".env")
+# Load environment variables from the .env file that sits next to this script,
+# so the setup helper works no matter which directory you launch it from.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 async def main():
     # Initialize LiveKit API

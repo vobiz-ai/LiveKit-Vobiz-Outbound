@@ -50,7 +50,7 @@ Call the Vobiz CDR API for the relevant time window and DID:
 ```bash
 curl -G "https://api.vobiz.ai/api/v1/Account/{auth_id}/cdr" \
   --data-urlencode "call_direction=inbound" \
-  --data-urlencode "to_number=+91XXXXXXXXXX" \
+  --data-urlencode "to_number=+15550003333" \
   --data-urlencode "start_date=2026-06-30" \
   --data-urlencode "end_date=2026-06-30" \
   --data-urlencode "per_page=50" \

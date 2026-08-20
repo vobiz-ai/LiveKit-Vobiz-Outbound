@@ -16,7 +16,7 @@ LIVEKIT_API_SECRET=...
 VOBIZ_SIP_DOMAIN=your-sip-domain.sip.vobiz.ai
 VOBIZ_USERNAME=your_username
 VOBIZ_PASSWORD=your_password
-VOBIZ_OUTBOUND_NUMBER=+91XXXXXXXXXX
+VOBIZ_OUTBOUND_NUMBER=+15550003333
 OUTBOUND_TRUNK_ID=ST_XXXXXXXXXXXX
 ```
 
@@ -48,9 +48,9 @@ The agent will connect to LiveKit and wait for a job.
 In a **separate terminal**, trigger an outbound call to your phone:
 
 ```powershell
-python make_call.py --to +91XXXXXXXXXX
+python make_call.py --to +15550003333
 ```
-*Replace `+91XXXXXXXXXX` with your actual phone number.*
+*Replace `+15550003333` with your actual phone number.*
 
 ## 5. Performing a Transfer
 
@@ -58,8 +58,8 @@ Once you answer the call and are talking to the agent:
 
 ### Default Transfer
 Say: **"Transfer me."** or **"Transfer me to a live agent."**
-*   **Action**: Agent transfers you to the default configured number (`+91XXXXXXXXXX`).
-*   **Mechanism**: The agent sends a SIP REFER to `sip:+91XXXXXXXXXX@<your-sip-domain>`.
+*   **Action**: Agent transfers you to the default configured number (`+15550003333`).
+*   **Mechanism**: The agent sends a SIP REFER to `sip:+15550003333@<your-sip-domain>`.
 
 ### Custom Transfer
 Say: **"Transfer me to +1 555 000 1234."**
