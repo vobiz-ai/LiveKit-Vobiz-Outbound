@@ -1,288 +1,107 @@
+"""Place outbound calls over a Vobiz SIP trunk with a LiveKit voice agent."""
+
+import json
 import logging
 import os
-import json
 from pathlib import Path
 
 from dotenv import load_dotenv
+from google.protobuf.duration_pb2 import Duration
 
-from livekit import agents, api
-from livekit.protocol import sip as sip_protocol
-from livekit.agents import AgentSession, Agent, RoomInputOptions
-from livekit.plugins import (
-    openai,
-    cartesia,
-    deepgram,
-    noise_cancellation,
-    silero,
+from livekit import api
+from livekit.agents import (
+    Agent,
+    AgentServer,
+    AgentSession,
+    JobContext,
+    TurnHandlingOptions,
+    cli,
+    inference,
 )
-from livekit.agents import llm
-from typing import Annotated, Optional
+from livekit.agents.beta import EndCallTool
+from livekit.protocol import sip as sip_protocol
 
-# Load environment variables from the .env file that sits next to this script,
-# so the agent works no matter which directory you launch it from.
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env.local")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("outbound-agent")
+logger = logging.getLogger("vobiz-outbound")
 
-
-# TRUNK ID - set OUTBOUND_TRUNK_ID in .env after you create your outbound trunk.
-# Create it with `lk sip outbound create` (LiveKit CLI) or in the LiveKit dashboard;
-# the id looks like ST_xxxxxxxxxxxx.
-OUTBOUND_TRUNK_ID = os.getenv("OUTBOUND_TRUNK_ID")
-SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN") 
-
-
-def _build_tts():
-    """Configure the Text-to-Speech provider based on env vars."""
-    provider = os.getenv("TTS_PROVIDER", "openai").lower()
-    
-    if provider == "cartesia":
-        logger.info("Using Cartesia TTS")
-        model = os.getenv("CARTESIA_TTS_MODEL", "sonic-2")
-        voice = os.getenv("CARTESIA_TTS_VOICE", "f786b574-daa5-4673-aa0c-cbe3e8534c02")
-        return cartesia.TTS(model=model, voice=voice)
-    
-    # Default to OpenAI
-    logger.info("Using OpenAI TTS")
-    model = os.getenv("OPENAI_TTS_MODEL", "tts-1")
-    voice = os.getenv("OPENAI_TTS_VOICE", "alloy")
-    return openai.TTS(model=model, voice=voice)
-
-
-
-class TransferFunctions(llm.ToolContext):
-    def __init__(self, ctx: agents.JobContext, phone_number: str = None):
-        super().__init__(tools=[])
-        self.ctx = ctx
-        self.phone_number = phone_number
-
-    @llm.function_tool(description="Transfer the call to a human support agent or another phone number.")
-    async def transfer_call(self, destination: Optional[str] = None):
-        """
-        Transfer the call.
-        """
-        if destination is None:
-            destination = os.getenv("DEFAULT_TRANSFER_NUMBER")
-            if not destination:
-                 return "Error: No default transfer number configured."
-        if "@" not in destination:
-            # If no domain is provided, append the SIP domain
-            if SIP_DOMAIN:
-                # Ensure clean number (strip tel: or sip: prefix if present but no domain)
-                clean_dest = destination.replace("tel:", "").replace("sip:", "")
-                destination = f"sip:{clean_dest}@{SIP_DOMAIN}"
-            else:
-                # Fallback to tel URI if no domain configured
-                if not destination.startswith("tel:") and not destination.startswith("sip:"):
-                     destination = f"tel:{destination}"
-        elif not destination.startswith("sip:"):
-             destination = f"sip:{destination}"
-        
-        logger.info(f"Transferring call to {destination}")
-        
-        # Determine the participant identity
-        # For outbound calls initiated by this agent, the participant identity is typically "sip_<phone_number>"
-        # For inbound, we might need to find the remote participant.
-        participant_identity = None
-        
-        # If we stored the phone number from metadata, we can construct the identity
-        if self.phone_number:
-            participant_identity = f"sip_{self.phone_number}"
-        else:
-            # Try to find a participant that is NOT the agent
-            for p in self.ctx.room.remote_participants.values():
-                participant_identity = p.identity
-                break
-        
-        if not participant_identity:
-            logger.error("Could not determine participant identity for transfer")
-            return "Failed to transfer: could not identify the caller."
-
-        try:
-            logger.info(f"Transferring participant {participant_identity} to {destination}")
-            await self.ctx.api.sip.transfer_sip_participant(
-                api.TransferSIPParticipantRequest(
-                    room_name=self.ctx.room.name,
-                    participant_identity=participant_identity,
-                    transfer_to=destination,
-                    play_dialtone=False
-                )
-            )
-            return "Transfer initiated successfully."
-        except Exception as e:
-            logger.error(f"Transfer failed: {e}")
-            return f"Error executing transfer: {e}"
+# Must match AGENT_NAME in make_call.py.
+AGENT_NAME = "outbound-caller"
+PARTICIPANT_IDENTITY = "phone-user"
+RINGING_TIMEOUT_SECONDS = 45
 
 
 class OutboundAssistant(Agent):
-
-    """
-    An AI agent tailored for outbound calls.
-    Attempts to be helpful and concise.
-    """
     def __init__(self) -> None:
         super().__init__(
-            instructions="""
-            You are a helpful and professional voice assistant calling from Vobiz.
-            
-            Key behaviors:
-            1. Introduce yourself clearly when the user answers.
-            2. Be concise and respect the user's time.
-            3. If asked, explain you are an AI assistant helping with a test call.
-            4. If the user asks to be transferred, call the transfer_call tool immediately.
-               If no number is specified, do NOT ask for one; just call the tool with the default.
-            """
+            instructions=(
+                "You are a voice AI assistant on an outbound phone call. "
+                "Say who you are when the person answers, and say you are an AI assistant if "
+                "you are asked. Keep replies to one or two short sentences, and do not use "
+                "lists, markdown or emojis. "
+                "When the person is finished, say goodbye and end the call."
+            ),
+            tools=[EndCallTool()],
         )
 
 
-def _log_sip_participant(p) -> None:
-    """Dump everything a (SIP) participant carries — used to discover what
-    Vobiz sends on inbound that we can correlate against the trunk webhook."""
-    attrs = dict(p.attributes or {})
-    logger.info("=" * 70)
-    logger.info("PARTICIPANT JOINED: identity=%s name=%s kind=%s", p.identity, p.name, getattr(p, "kind", "?"))
-    if p.metadata:
-        logger.info("  participant.metadata = %s", p.metadata)
-    # Correlation-relevant SIP attributes first
-    for key in ("sip.callID", "sip.callIDFull", "sip.callStatus", "sip.trunkID",
-                "sip.ruleID", "sip.phoneNumber", "sip.trunkPhoneNumber", "sip.host"):
-        if key in attrs:
-            logger.info("  %-24s = %s", key, attrs[key])
-    # Any mapped SIP headers (require include_headers / headers_to_attributes on the trunk)
-    hdrs = {k: v for k, v in attrs.items() if k.startswith("sip.h.")}
-    if hdrs:
-        logger.info("  --- forwarded SIP headers (sip.h.*) ---")
-        for k, v in hdrs.items():
-            logger.info("  %-24s = %s", k, v)
-    else:
-        logger.info("  (no sip.h.* headers — Vobiz sent none, or trunk include_headers is off)")
-    # Everything else, so nothing is missed
-    other = {k: v for k, v in attrs.items() if not k.startswith("sip.")}
-    if other:
-        logger.info("  --- other attributes ---")
-        for k, v in other.items():
-            logger.info("  %-24s = %s", k, v)
-    logger.info("=" * 70)
+server = AgentServer()
 
 
-async def entrypoint(ctx: agents.JobContext):
-    """
-    Main entrypoint for the agent.
+@server.rtc_session(agent_name=AGENT_NAME)
+async def entrypoint(ctx: JobContext) -> None:
+    ctx.log_context_fields = {"room": ctx.room.name}
 
-    For outbound calls:
-    1. Checks for 'phone_number' in the job metadata.
-    2. Connects to the room.
-    3. Initiates the SIP call to the phone number.
-    4. Waits for answer before speaking.
-    """
-    logger.info(f"Connecting to room: {ctx.room.name}")
-    logger.info("JOB metadata = %r", ctx.job.metadata)
+    # make_call.py puts the call details in the dispatch metadata.
+    metadata = json.loads(ctx.job.metadata)
 
-    # Log SIP attributes for any participant that joins (key for inbound correlation)
-    @ctx.room.on("participant_connected")
-    def _on_participant(p):
-        _log_sip_participant(p)
+    session: AgentSession = AgentSession(
+        stt=inference.STT("deepgram/nova-3", language="multi"),
+        llm=inference.LLM("openai/gpt-4.1-mini"),
+        tts=inference.TTS("cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
+        turn_handling=TurnHandlingOptions(turn_detection=inference.TurnDetector()),
+    )
 
-    # Also dump anyone already in the room when we attach
-    for _p in ctx.room.remote_participants.values():
-        _log_sip_participant(_p)
-    
-    # parse the phone number from the metadata sent by the dispatch script
-    phone_number = None
-    sip_headers = None
-    from_number = None
+    async def hangup() -> None:
+        # Deleting the room ends the phone call for the SIP participant.
+        await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
+
+    ctx.add_shutdown_callback(hangup)
+
+    # Start the session first so none of the callee's audio is lost after they answer.
+    await session.start(agent=OutboundAssistant(), room=ctx.room)
+    if not session.room_io:
+        raise RuntimeError("room_io is unavailable, use the dev or start command")
+    session.room_io.set_participant(PARTICIPANT_IDENTITY)
+
     try:
-        if ctx.job.metadata:
-            data = json.loads(ctx.job.metadata)
-            phone_number = data.get("phone_number")
-            sip_headers = data.get("sip_headers")
-            from_number = data.get("from_number")
-    except Exception:
-        logger.warning("No valid JSON metadata found. This might be an inbound call.")
-
-    # Initialize function context
-    fnc_ctx = TransferFunctions(ctx, phone_number)
-
-    # Initialize the Agent Session with plugins
-
-    session = AgentSession(
-        stt=deepgram.STT(model="nova-3", language="multi"),
-        llm=openai.LLM(model="gpt-4o-mini"),
-        tts=_build_tts(),
-        tools=fnc_ctx.flatten(),
-    )
-
-    # Start the session
-    await session.start(
-        room=ctx.room,
-        agent=OutboundAssistant(),
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVCTelephony(),
-            close_on_disconnect=True, # Close room when agent disconnects
-        ),
-    )
-
-    # Participants already present at connect time do NOT fire participant_connected,
-    # so dump them explicitly now (this is the inbound SIP caller).
-    if ctx.room.remote_participants:
-        logger.info("Participants already in room at connect: %d", len(ctx.room.remote_participants))
-        for _p in ctx.room.remote_participants.values():
-            _log_sip_participant(_p)
-    else:
-        logger.info("No participants yet; waiting for one to dump attributes…")
-        try:
-            _p = await ctx.wait_for_participant()
-            _log_sip_participant(_p)
-        except Exception as _e:
-            logger.warning("wait_for_participant failed: %s", _e)
-
-    if phone_number:
-        logger.info(f"Initiating outbound SIP call to {phone_number}...")
-        try:
-            # Create a SIP participant to dial out
-            # This effectively "calls" the phone number and brings them into this room
-            await ctx.api.sip.create_sip_participant(
-                api.CreateSIPParticipantRequest(
-                    room_name=ctx.room.name,
-                    sip_trunk_id=OUTBOUND_TRUNK_ID,
-                    sip_call_to=phone_number,
-                    participant_identity=f"sip_{phone_number}", # Unique ID for the SIP user
-                    wait_until_answered=True, # Important: Wait for pickup before continuing
-                    headers=sip_headers or {},
-                    include_headers=sip_protocol.SIP_X_HEADERS,
-                    # Override the caller ID (from number) when provided; otherwise the
-                    # trunk's default number is used.
-                    sip_number=from_number or "",
-                )
+        await ctx.api.sip.create_sip_participant(
+            api.CreateSIPParticipantRequest(
+                room_name=ctx.room.name,
+                sip_trunk_id=os.environ["SIP_OUTBOUND_TRUNK_ID"],
+                sip_call_to=metadata["phone_number"],
+                sip_number=metadata.get("from_number", ""),
+                participant_identity=PARTICIPANT_IDENTITY,
+                headers=metadata.get("sip_headers", {}),
+                include_headers=sip_protocol.SIP_X_HEADERS,
+                krisp_enabled=True,
+                ringing_timeout=Duration(seconds=RINGING_TIMEOUT_SECONDS),
+                wait_until_answered=True,
             )
-            logger.info("Call answered! Agent is now listening.")
-            
-            # Note: We do NOT generate an initial reply here immediately.
-            # Usually for outbound, we want to hear "Hello?" from the user first,
-            # OR we can speak immediately. 
-            # If you want the agent to speak first, uncomment the lines below:
-            
-            # await session.generate_reply(
-            #     instructions="The user has answered. Introduce yourself immediately."
-            # )
-            
-        except Exception as e:
-            logger.error(f"Failed to place outbound call: {e}")
-            # Ensure we clean up if the call fails
-            ctx.shutdown()
-    else:
-        # Fallback for inbound calls (if this agent is used for that)
-        logger.info("No phone number in metadata. Treating as inbound/web call.")
-        await session.generate_reply(instructions="Greet the user.")
+        )
+    except api.TwirpError as e:
+        # Covers rejected calls and calls that ring out without an answer.
+        logger.warning(f"call did not connect: {e.message}")
+        ctx.shutdown("call did not connect")
+        return
+
+    # sip.callIDFull identifies this call in the Vobiz CDR, so log it to join the two records.
+    callee = ctx.room.remote_participants.get(PARTICIPANT_IDENTITY)
+    call_id = callee.attributes.get("sip.callIDFull") if callee else None
+    logger.info("call answered", extra={"sip_call_id": call_id})
+
+    # The agent waits for the callee to say hello. To speak first, call session.generate_reply().
 
 
 if __name__ == "__main__":
-    # The agent name "outbound-caller" is used by the dispatch script to find this worker
-    agents.cli.run_app(
-        agents.WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            agent_name="outbound-caller", 
-        )
-    )
+    cli.run_app(server)

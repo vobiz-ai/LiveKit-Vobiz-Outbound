@@ -1,51 +1,59 @@
+"""Create the LiveKit outbound trunk for Vobiz, or update it if SIP_OUTBOUND_TRUNK_ID is set."""
+
 import asyncio
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+
 from livekit import api
 
-# Load environment variables from the .env file that sits next to this script,
-# so the setup helper works no matter which directory you launch it from.
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env.local")
 
-async def main():
-    # Initialize LiveKit API
-    # Credentials (LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET) are auto-loaded from .env
+
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise SystemExit(f"{name} is not set in .env.local")
+    return value
+
+
+async def main() -> None:
+    address = require_env("VOBIZ_SIP_DOMAIN")
+    username = require_env("VOBIZ_USERNAME")
+    password = require_env("VOBIZ_PASSWORD")
+    number = require_env("VOBIZ_OUTBOUND_NUMBER")
+    trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
+
     lkapi = api.LiveKitAPI()
-    sip = lkapi.sip
-    
-    trunk_id = os.getenv("OUTBOUND_TRUNK_ID")
-    address = os.getenv("VOBIZ_SIP_DOMAIN")
-    username = os.getenv("VOBIZ_USERNAME")
-    password = os.getenv("VOBIZ_PASSWORD")
-    number = os.getenv("VOBIZ_OUTBOUND_NUMBER")
-    
-    if not trunk_id:
-        print("Error: OUTBOUND_TRUNK_ID not found in .env")
-        return
-
-    print(f"Updating SIP Trunk: {trunk_id}")
-    print(f"  Address: {address}")
-    print(f"  Username: {username}")
-    print(f"  Numbers: [{number}]")
-
     try:
-        # Update the trunk with the correct credentials and settings
-        await sip.update_outbound_trunk_fields(
-            trunk_id,
-            address=address,
-            auth_username=username,
-            auth_password=password,
-            numbers=[number] if number else [],
+        if trunk_id:
+            await lkapi.sip.update_outbound_trunk_fields(
+                trunk_id,
+                address=address,
+                auth_username=username,
+                auth_password=password,
+                numbers=[number],
+            )
+            print(f"Updated outbound trunk {trunk_id}")
+            return
+
+        trunk = await lkapi.sip.create_outbound_trunk(
+            api.CreateSIPOutboundTrunkRequest(
+                trunk=api.SIPOutboundTrunkInfo(
+                    name="Vobiz outbound",
+                    address=address,
+                    numbers=[number],
+                    auth_username=username,
+                    auth_password=password,
+                )
+            )
         )
-        print("\n✅ SIP Trunk updated successfully!")
-        print("The 'max auth retry attempts' error should be resolved now.")
-        
-    except Exception as e:
-        print(f"\n❌ Failed to update trunk: {e}")
+        print(f"Created outbound trunk {trunk.sip_trunk_id}")
+        print(f"Add this to .env.local: SIP_OUTBOUND_TRUNK_ID={trunk.sip_trunk_id}")
     finally:
         await lkapi.aclose()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -1,96 +1,77 @@
+"""Dispatch the agent to place a call."""
+
 import argparse
 import asyncio
-import os
-import random
 import json
+import re
+import secrets
 from pathlib import Path
 
 from dotenv import load_dotenv
+
 from livekit import api
 
-# Load environment variables from the .env file that sits next to this script,
-# so the dispatcher works no matter which directory you launch it from.
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env.local")
 
-async def main():
-    parser = argparse.ArgumentParser(description="Make an outbound call via LiveKit Agent.")
-    parser.add_argument("--to", required=True, help="The phone number to call in E.164 format (e.g., +15550003333)")
+AGENT_NAME = "outbound-caller"  # must match AGENT_NAME in agent.py
+E164 = re.compile(r"\+[1-9]\d{6,14}")
+
+
+def e164(value: str) -> str:
+    value = value.strip()
+    if not E164.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not in E.164 format, like +919876543210")
+    return value
+
+
+def sip_header(value: str) -> tuple[str, str]:
+    key, separator, header_value = value.partition("=")
+    if not separator:
+        raise argparse.ArgumentTypeError(f"{value!r} is not in KEY=VALUE format")
+    if not key.startswith("X-VH-"):
+        raise argparse.ArgumentTypeError(f"{key!r} must start with X-VH-, or Vobiz drops it")
+    return key, header_value
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--to", required=True, type=e164, help="number to call, in E.164 format")
     parser.add_argument(
-        "--from", dest="from_number", default=None, metavar="+E164",
-        help="Override the caller ID (from number). Must be authorized on the trunk. "
-             "Defaults to the trunk's configured number."
+        "--from",
+        dest="from_number",
+        type=e164,
+        help="caller ID, which must be a number on your trunk. Defaults to the trunk's number",
     )
     parser.add_argument(
-        "--header", action="append", default=[], metavar="KEY=VALUE",
-        help="Custom SIP X-VH-* header to include in the INVITE (repeatable). "
-             "Example: --header X-VH-CorrelationId=abc-123"
+        "--header",
+        action="append",
+        default=[],
+        type=sip_header,
+        metavar="X-VH-KEY=VALUE",
+        help="custom SIP header for the INVITE. Can be repeated",
     )
     args = parser.parse_args()
 
-    # Parse --header KEY=VALUE pairs
-    sip_headers = {}
-    for h in args.header:
-        if "=" not in h:
-            print(f"ERROR: --header must be KEY=VALUE, got: {h!r}")
-            return
-        key, _, value = h.partition("=")
-        if not key.startswith("X-VH-"):
-            print(f"WARNING: header {key!r} does not start with 'X-VH-' — Vobiz will drop it")
-        sip_headers[key] = value
+    metadata: dict[str, object] = {"phone_number": args.to}
+    if args.from_number:
+        metadata["from_number"] = args.from_number
+    if args.header:
+        metadata["sip_headers"] = dict(args.header)
 
-    # 1. Validation
-    phone_number = args.to.strip()
-    if not phone_number.startswith("+"):
-        print("Error: Phone number must start with '+' and country code.")
-        return
-
-    url = os.getenv("LIVEKIT_URL")
-    api_key = os.getenv("LIVEKIT_API_KEY")
-    api_secret = os.getenv("LIVEKIT_API_SECRET")
-
-    if not (url and api_key and api_secret):
-        print("Error: LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET missing in .env")
-        return
-
-    # 2. Setup API Client
-    lk_api = api.LiveKitAPI(url=url, api_key=api_key, api_secret=api_secret)
-
-    # 3. Create a unique room for this call
-    # We use a random suffix to ensure room names are unique
-    room_name = f"call-{phone_number.replace('+', '')}-{random.randint(1000, 9999)}"
-
-    print(f"Initiating call to {phone_number}...")
-    print(f"Session Room: {room_name}")
-
+    lkapi = api.LiveKitAPI()
     try:
-        # 4. Dispatch the Agent
-        # We explicitly tell LiveKit to send the 'outbound-caller' agent to this room.
-        # We pass the phone number in the 'metadata' field so the agent knows who to dial.
-        metadata = {"phone_number": phone_number}
-        if sip_headers:
-            metadata["sip_headers"] = sip_headers
-        if args.from_number:
-            metadata["from_number"] = args.from_number.strip()
-            
-        dispatch_request = api.CreateAgentDispatchRequest(
-            agent_name="outbound-caller", # Must match agent.py
-            room=room_name,
-            metadata=json.dumps(metadata)
+        dispatch = await lkapi.agent_dispatch.create_dispatch(
+            api.CreateAgentDispatchRequest(
+                agent_name=AGENT_NAME,
+                room=f"call-{secrets.token_hex(4)}",
+                metadata=json.dumps(metadata),
+            )
         )
-        
-        dispatch = await lk_api.agent_dispatch.create_dispatch(dispatch_request)
-
-        print("\n✅ Call Dispatched Successfully!")
-        print(f"Dispatch ID: {dispatch.id}")
-        print("-" * 40)
-        print("The agent is now joining the room and will dial the number.")
-        print("Check your agent terminal for logs.")
-        
-    except Exception as e:
-        print(f"\n❌ Error dispatching call: {e}")
-    
     finally:
-        await lk_api.aclose()
+        await lkapi.aclose()
+
+    print(f"Dispatched {dispatch.id} to room {dispatch.room}. See the agent log for the call.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

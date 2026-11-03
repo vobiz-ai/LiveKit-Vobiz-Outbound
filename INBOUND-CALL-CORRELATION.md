@@ -28,7 +28,7 @@ Inbound callers are already in the room when your agent connects, so read the
 participant attributes right after the session starts:
 
 ```python
-await session.start(room=ctx.room, agent=YourAgent(), room_input_options=...)
+await session.start(room=ctx.room, agent=YourAgent())
 
 for p in ctx.room.remote_participants.values():
     attrs = p.attributes or {}
